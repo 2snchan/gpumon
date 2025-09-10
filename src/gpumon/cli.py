@@ -141,7 +141,21 @@ def colorize_host(h: str, stale_age: Optional[float], has_error: bool) -> Text:
     else:
         return Text(h_fixed, style="bold red")
 
+def _band_key(last_ok_ts: Optional[float], has_error: bool, now_ts: float) -> str:
+    """색상 구간을 키로 환산(OK / STALE1 / STALE2 / ERR) → 소소한 시간 변화로 재렌더 방지."""
+    if has_error and last_ok_ts is None:
+        return "ERR"
+    if last_ok_ts is None:
+        return "OK"
+    age = now_ts - last_ok_ts
+    if age < 10:
+        return "OK"
+    if age < 30:
+        return "STALE1"
+    return "STALE2"
+
 def percent_style(kind: str, p: float) -> str:
+    # (네가 둔 컬러 스킴 유지)
     if kind == "util":
         if p >= 80: return "red"
         if p >= 20: return "yellow"
@@ -159,7 +173,10 @@ def fixed_pct(p: float) -> str:
 def fixed_mib_pair(used: int, total: int) -> str:
     return f"{used:>6}/{total:<6} MiB"
 
-def decide_bar_len(console_width: int, name_avg_len: int = 22) -> int:
+# ---------- bar 길이 결정(히스테리시스 포함) ----------
+HYSTERESIS_COLS = 6
+
+def _decide_bar_len_base(console_width: int, name_avg_len: int = 22) -> int:
     fixed_est = 43
     text_payload_est = 25
     free = max(0, console_width - fixed_est - name_avg_len - text_payload_est)
@@ -175,14 +192,36 @@ def decide_bar_len(console_width: int, name_avg_len: int = 22) -> int:
         return 18
     return 22
 
+def decide_bar_len(console_width: int, prev_len: Optional[int]) -> int:
+    target = _decide_bar_len_base(console_width)
+    if prev_len is None:
+        return target
+    if abs(target - prev_len) < HYSTERESIS_COLS:
+        return prev_len
+    return target
+
 def draw_bar(pct: float, length: int, style: str) -> Text:
     length = max(3, length)
     fill = int(round((pct / 100.0) * length))
     fill = max(0, min(length, fill))
     return Text("█" * fill + "░" * (length - fill), style=style)
 
-def format_util_mem(util: Optional[float], mem_used: int, mem_total: int, console_width: int) -> Tuple[Text, Text]:
-    bar_len = decide_bar_len(console_width)
+def _util_cell_width(bar_len:int) -> int:
+    # bar + space + "100%"(4)
+    return (bar_len + 5) if bar_len > 0 else 4
+
+def _mem_cell_width(bar_len:int) -> int:
+    # bar + space + "100%" + space + " 123456/123456 MiB"(~17)
+    return (bar_len + 23) if bar_len > 0 else (4 + 1 + 17)
+
+def _compute_name_width(console_width:int, bar_len:int, user_w:int=12) -> int:
+    host_w = 9; cuda_w = 5; gpu_w = 2; temp_w = 3
+    util_w = _util_cell_width(bar_len); mem_w = _mem_cell_width(bar_len)
+    padding_budget = 8
+    name_w = console_width - (host_w + cuda_w + gpu_w + user_w + temp_w + util_w + mem_w + padding_budget)
+    return max(12, name_w)
+
+def format_util_mem(util: Optional[float], mem_used: int, mem_total: int, bar_len: int) -> Tuple[Text, Text]:
     util_pct = 0.0 if (util is None or math.isnan(util)) else max(0.0, min(100.0, float(util)))
     util_style = percent_style("util", util_pct)
     util_pct_text = Text(fixed_pct(util_pct), style=util_style)
@@ -293,16 +332,28 @@ def parse_gpu_rows(text: str):
             pass
     return rows, driver, uuid_by_index
 
-def render_table(state: Dict[str, dict], interval: float, now_ts: float, console_width: int) -> Table:
-    tbl = Table(title=f"Multi-Server GPU Monitor", box=box.SIMPLE_HEAVY)
-    tbl.add_column("Host", no_wrap=True)
-    tbl.add_column("CUDA", no_wrap=True)
-    tbl.add_column("GPU", justify="right", no_wrap=True)
-    tbl.add_column("User", no_wrap=True)
-    tbl.add_column("Name", no_wrap=False)
-    tbl.add_column("Util", justify="left", no_wrap=False)
-    tbl.add_column("Mem", justify="left", no_wrap=False)
-    tbl.add_column("Temp", justify="right", no_wrap=True)
+# ---------- 고정폭 렌더(행 높이 고정 + ellipsis) ----------
+def render_table(state: Dict[str, dict], interval: float, now_ts: float, console_width: int, bar_len:int) -> Table:
+    user_w = 12
+    name_w = _compute_name_width(console_width, bar_len, user_w=user_w)
+    util_w = _util_cell_width(bar_len)
+    mem_w  = _mem_cell_width(bar_len)
+
+    tbl = Table(
+        title="Multi-Server GPU Monitor",
+        box=box.SIMPLE,
+        show_header=True,
+        expand=False,
+        pad_edge=False,
+    )
+    tbl.add_column("Host", width=9,  no_wrap=True)
+    tbl.add_column("CUDA", width=5,  no_wrap=True, justify="right")
+    tbl.add_column("GPU",  width=2,  no_wrap=True, justify="right")
+    tbl.add_column("User", width=user_w, no_wrap=True, overflow="ellipsis")
+    tbl.add_column("Name", width=name_w, no_wrap=True, overflow="ellipsis")
+    tbl.add_column("Util", width=util_w, no_wrap=True)
+    tbl.add_column("Mem",  width=mem_w,  no_wrap=True)
+    tbl.add_column("Temp", width=3,  no_wrap=True, justify="right")
 
     for host_key, data in state.items():
         sh = short_host(host_key)
@@ -320,10 +371,12 @@ def render_table(state: Dict[str, dict], interval: float, now_ts: float, console
 
         first = True
         for r in sorted(gpus, key=lambda x: x["idx"]):
-            util_cell, mem_cell = format_util_mem(float(r["util"]), r["mem_used"], r["mem_total"], console_width)
+            util_cell, mem_cell = format_util_mem(float(r["util"]), r["mem_used"], r["mem_total"], bar_len)
             temp_cell = colorize_temp(r["temp"])
-            name_cell = Text(r["name"], style="cyan")
-            user_cell = Text(top_user_by_idx.get(r["idx"]) or "-", style="green3")
+
+            name_cell = Text(r["name"], style="cyan"); name_cell.truncate(name_w, overflow="ellipsis")
+            user_txt = top_user_by_idx.get(r["idx"]) or "-"
+            user_cell = Text(user_txt, style="green3"); user_cell.truncate(user_w, overflow="ellipsis")
 
             tbl.add_row(
                 host_cell if first else Text(" " * 9),
@@ -338,6 +391,21 @@ def render_table(state: Dict[str, dict], interval: float, now_ts: float, console
             first = False
     return tbl
 
+# ---------- digest(변경 감지) ----------
+def build_digest(state: Dict[str, dict], now_ts: float) -> Tuple:
+    out = []
+    for host_key in sorted(state.keys()):
+        d = state[host_key]
+        band = _band_key(d.get("last_ok_ts"), bool(d.get("error")), now_ts)
+        cuda = d.get("cuda")
+        gpus = tuple(
+            (r["idx"], r["name"], r["util"], r["mem_used"], r["mem_total"], r["temp"])
+            for r in sorted(d.get("gpus", []), key=lambda x: x["idx"])
+        )
+        users_t = tuple(sorted((d.get("top_user_by_idx") or {}).items()))
+        out.append((short_host(host_key), band, cuda, gpus, users_t))
+    return tuple(out)
+
 async def _amain(args: argparse.Namespace) -> None:
     hosts = parse_hosts(args.hosts)
     if not hosts:
@@ -349,6 +417,9 @@ async def _amain(args: argparse.Namespace) -> None:
         h: {"gpus": [], "last_ok_ts": None, "error": None, "warmed": False,
             "cuda": None, "driver": None, "top_user_by_idx": {}} for h in hosts
     }
+
+    prev_bar_len: Optional[int] = None
+    prev_digest: Optional[Tuple] = None
 
     sem = asyncio.Semaphore(max(1, CONCURRENCY))
 
@@ -388,13 +459,28 @@ async def _amain(args: argparse.Namespace) -> None:
                 last_line = (err.strip().splitlines() or [""])[-1] if err else f"rc={rc}"
                 state[h]["error"] = last_line
 
-    with Live(Panel("Initializing...", border_style="cyan"), refresh_per_second=24, console=console) as live:
+    with Live(
+        Panel("Initializing...", border_style="cyan"),
+        refresh_per_second=24,
+        console=console,
+        auto_refresh=False,                 # ★ 자동 리프레시 금지
+    ) as live:
         while True:
             tasks = [poll_host(h) for h in hosts]
             await asyncio.gather(*tasks, return_exceptions=True)
             now_ts = time.time()
+
+            # 프레임 공통 bar 길이(히스테리시스)
             width = console.size.width
-            live.update(render_table(state, args.interval, now_ts, width))
+            bar_len = decide_bar_len(width, prev_bar_len)
+            prev_bar_len = bar_len
+
+            # 변경 감지 → 동일하면 렌더 생략(깜빡임 원천 차단)
+            digest = build_digest(state, now_ts)
+            if digest != prev_digest:
+                prev_digest = digest
+                live.update(render_table(state, args.interval, now_ts, width, bar_len), refresh=True)
+
             await asyncio.sleep(args.interval)
 
 def run() -> None:
