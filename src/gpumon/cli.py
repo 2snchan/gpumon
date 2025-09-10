@@ -23,6 +23,7 @@ from rich import box
 
 console = Console()
 
+# ===== Fixed constants =====
 CONCURRENCY = 2
 JITTER = 0.4
 TIMEOUT = 10.0
@@ -32,20 +33,32 @@ SSH_OPT = ""
 
 CSV_OPTS = "--format=csv,noheader,nounits"
 
+# GPU query (uuid for per-GPU user mapping)
 QUERY_GPU = (
     "--query-gpu=index,uuid,name,utilization.gpu,temperature.gpu,memory.used,memory.total,driver_version"
 )
 
+# CUDA version (some drivers don't expose via query)
 CUDA_PARSE_CMD = r"nvidia-smi -q | sed -n 's/.*CUDA Version *: *\([0-9.]\+\).*/\1/p' | head -n1"
 
+# Compute apps: per-GPU top user resolution
 APPS_QUERY = "--query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits"
 
+# Config file path (~/.gpumon)
 CONFIG_PATH = Path.home() / ".gpumon"
 
 
-# ----------------------------- Config I/O -----------------------------
+# ============================= Config I/O =============================
 
 def load_config() -> Dict[str, object]:
+    """Load JSON config from ~/.gpumon. Keys we use:
+       - hosts_content: str (the actual content of hosts file)
+       - interval: float
+       - ssh_key: str
+       - blacklist: str
+       - initial_wait: int
+       - last_used_hosts_path: str (optional, for convenience)
+    """
     try:
         if CONFIG_PATH.exists():
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -56,22 +69,25 @@ def load_config() -> Dict[str, object]:
     return {}
 
 def save_config(cfg: Dict[str, object]) -> None:
+    """Persist JSON config to ~/.gpumon (0600 on POSIX)."""
     try:
         CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if os.name == "posix":
             with contextlib.suppress(Exception):
                 os.chmod(CONFIG_PATH, 0o600)
     except Exception:
-        # 저장 실패는 치명적이지 않으므로 무시
+        # Not fatal
         pass
 
 
-# ----------------------------- Helpers -----------------------------
+# ============================= Helpers =============================
 
-def parse_hosts(path: str) -> List[str]:
+def parse_hosts_file(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
-        hosts = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
-    return hosts
+        return [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+
+def parse_hosts_text(text: str) -> List[str]:
+    return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
 
 def which_ssh() -> str:
     return "ssh.exe" if platform.system().lower().startswith("win") else "ssh"
@@ -147,7 +163,7 @@ def gpu_idx_blacklisted(host_label: str, idx: int, bl: Dict[str, Set[int]]) -> b
     return False
 
 
-# ----------------------------- Styling -----------------------------
+# ============================= Styling =============================
 
 def colorize_temp(t: Optional[int]) -> Text:
     if t is None:
@@ -193,7 +209,7 @@ def fixed_mib_pair(used: int, total: int) -> str:
     return f"{used:>6}/{total:<6} MiB"
 
 
-# ----------------------------- Bars (원래 로직 유지) -----------------------------
+# ============================= Bars (original logic kept) =============================
 
 def decide_bar_len(console_width: int, name_avg_len: int = 22) -> int:
     fixed_est = 43
@@ -239,7 +255,7 @@ def format_util_mem(util: Optional[float], mem_used: int, mem_total: int, consol
     return util_cell, mem_cell
 
 
-# ----------------------------- SSH / Queries -----------------------------
+# ============================= SSH / Queries =============================
 
 async def ssh_run(host: str, cmd: str, identity: str) -> Tuple[int, str, str, float]:
     t0 = time.time()
@@ -308,7 +324,7 @@ async def fetch_apps_top_users_per_gpu(host: str, identity: str) -> Tuple[Dict[s
     return top_pid_by_uuid, user_by_pid
 
 
-# ----------------------------- Parsing -----------------------------
+# ============================= Parsing =============================
 
 def parse_gpu_rows(text: str):
     rows = []
@@ -336,7 +352,7 @@ def parse_gpu_rows(text: str):
     return rows, driver, uuid_by_index
 
 
-# ----------------------------- Rendering (원래 로직 유지) -----------------------------
+# ============================= Rendering (original layout) =============================
 
 def render_table(state: Dict[str, dict], interval: float, now_ts: float, console_width: int) -> Table:
     tbl = Table(title=f"Multi-Server GPU Monitor", box=box.SIMPLE_HEAVY)
@@ -384,7 +400,7 @@ def render_table(state: Dict[str, dict], interval: float, now_ts: float, console
     return tbl
 
 
-# ----------------------------- 변경 감지 -----------------------------
+# ============================= Change detection =============================
 
 def _band_key(last_ok_ts: Optional[float], has_error: bool, now_ts: float) -> str:
     if has_error and last_ok_ts is None:
@@ -413,14 +429,15 @@ def build_digest(state: Dict[str, dict], now_ts: float) -> Tuple:
     return tuple(out)
 
 
-# ----------------------------- Main -----------------------------
+# ============================= Main =============================
 
 async def _amain(args: argparse.Namespace) -> None:
-    # 실행 시 1회만 콘솔 clear + 빈 줄 출력
+    # clear once and print a blank line
     console.clear()
     console.print()
 
-    hosts = parse_hosts(args.hosts)
+    # we get hosts_lines directly (already parsed)
+    hosts = args.hosts_lines
     if not hosts:
         console.print("[red]No hosts found[/red]")
         sys.exit(1)
@@ -474,7 +491,7 @@ async def _amain(args: argparse.Namespace) -> None:
         Panel("Initializing...", border_style="cyan"),
         refresh_per_second=24,
         console=console,
-        auto_refresh=False,  # 변경 시에만 수동 업데이트
+        auto_refresh=False,  # only update when digest changes
     ) as live:
         while True:
             tasks = [poll_host(h) for h in hosts]
@@ -490,42 +507,60 @@ async def _amain(args: argparse.Namespace) -> None:
             await asyncio.sleep(args.interval)
 
 def run() -> None:
-    ap = argparse.ArgumentParser(description="Multi-host GPU terminal monitor (Windows-friendly)")
-    # 모든 옵션을 선택적으로 받아서 ~/.gpumon 으로 보완/저장
-    ap.add_argument("-H", "--hosts", default=None, help="hosts file (alias/fqdn/user@host each line)")
+    ap = argparse.ArgumentParser(description="Multi-host GPU terminal monitor")
+    # All optional — if omitted, read ~/.gpumon
+    ap.add_argument("-H", "--hosts", default=None, help="hosts file path (alias/fqdn/user@host each line)")
     ap.add_argument("-i", "--interval", type=float, default=None, help="refresh interval seconds")
-    ap.add_argument("--ssh-key", default=None, help="identity file (e.g. C:\\Users\\you\\.ssh\\id_ed25519)")
+    ap.add_argument("--ssh-key", default=None, help="identity file path (e.g. ~/.ssh/id_ed25519)")
     ap.add_argument("--blacklist", default=None, help="GPU blacklist, e.g. 'monday:0,1;gloryday:2;*:7'")
     ap.add_argument("--initial-wait", type=int, default=None, help="per-host first-connection wait seconds")
     args_in = ap.parse_args()
 
-    # 1) 기존 설정 로드
+    # 1) Load existing config
     cfg = load_config()
 
-    # 2) 인자와 설정 병합 (인자가 우선)
-    hosts_path = args_in.hosts or cfg.get("hosts")
-    interval   = args_in.interval if args_in.interval is not None else cfg.get("interval", 1)
-    ssh_key    = args_in.ssh_key if args_in.ssh_key is not None else cfg.get("ssh_key", "")
-    blacklist  = args_in.blacklist if args_in.blacklist is not None else cfg.get("blacklist", "")
-    init_wait  = args_in.initial_wait if args_in.initial_wait is not None else cfg.get("initial_wait", 5)
+    # 2) Resolve hosts content (prefer CLI)
+    hosts_content: Optional[str] = None
+    last_used_path = None
+    if args_in.hosts:
+        last_used_path = args_in.hosts
+        try:
+            hosts_content = Path(args_in.hosts).read_text(encoding="utf-8")
+        except Exception as e:
+            console.print(f"[red]Failed to read hosts file:[/red] {e}")
+            sys.exit(1)
+    else:
+        hosts_content = cfg.get("hosts_content")
 
-    if not hosts_path:
-        console.print("[red]No hosts provided and no ~/.gpumon config found.[/red]")
+    if not hosts_content:
+        console.print("[red]No hosts content provided and no ~/.gpumon config found.[/red]")
         console.print("Usage: gpumon -H hosts.txt [--ssh-key KEY] [--blacklist SPEC] [--initial-wait N] [-i SECS]")
         sys.exit(1)
 
-    # 3) 최종 설정 저장(마지막 사용값을 ~/.gpumon 에 기록)
+    hosts_lines = parse_hosts_text(hosts_content)
+    if not hosts_lines:
+        console.print("[red]Parsed hosts list is empty.[/red]")
+        sys.exit(1)
+
+    # 3) Merge other args with config (CLI precedes)
+    interval  = args_in.interval if args_in.interval is not None else cfg.get("interval", 1)
+    ssh_key   = args_in.ssh_key if args_in.ssh_key is not None else cfg.get("ssh_key", "")
+    blacklist = args_in.blacklist if args_in.blacklist is not None else cfg.get("blacklist", "")
+    init_wait = args_in.initial_wait if args_in.initial_wait is not None else cfg.get("initial_wait", 5)
+
+    # 4) Save merged config (store hosts_content, not just path)
     save_config({
-        "hosts": hosts_path,
+        "hosts_content": hosts_content,
         "interval": interval,
         "ssh_key": ssh_key,
         "blacklist": blacklist,
         "initial_wait": init_wait,
+        "last_used_hosts_path": last_used_path or cfg.get("last_used_hosts_path", ""),
     })
 
-    # 4) 병합된 인자로 실행
+    # 5) Run with resolved arguments
     merged = argparse.Namespace(
-        hosts=hosts_path,
+        hosts_lines=hosts_lines,
         interval=interval,
         ssh_key=ssh_key,
         blacklist=blacklist,
