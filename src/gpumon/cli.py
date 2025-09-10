@@ -38,6 +38,8 @@ CUDA_PARSE_CMD = r"nvidia-smi -q | sed -n 's/.*CUDA Version *: *\([0-9.]\+\).*/\
 APPS_QUERY = "--query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits"
 
 
+# ----------------------------- Helpers -----------------------------
+
 def parse_hosts(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
         hosts = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
@@ -116,6 +118,9 @@ def gpu_idx_blacklisted(host_label: str, idx: int, bl: Dict[str, Set[int]]) -> b
             return True
     return False
 
+
+# ----------------------------- Styling -----------------------------
+
 def colorize_temp(t: Optional[int]) -> Text:
     if t is None:
         return Text("-", style="dim")
@@ -141,21 +146,8 @@ def colorize_host(h: str, stale_age: Optional[float], has_error: bool) -> Text:
     else:
         return Text(h_fixed, style="bold red")
 
-def _band_key(last_ok_ts: Optional[float], has_error: bool, now_ts: float) -> str:
-    """색상 구간을 키로 환산(OK / STALE1 / STALE2 / ERR) → 소소한 시간 변화로 재렌더 방지."""
-    if has_error and last_ok_ts is None:
-        return "ERR"
-    if last_ok_ts is None:
-        return "OK"
-    age = now_ts - last_ok_ts
-    if age < 10:
-        return "OK"
-    if age < 30:
-        return "STALE1"
-    return "STALE2"
-
 def percent_style(kind: str, p: float) -> str:
-    # (네가 둔 컬러 스킴 유지)
+    # 네가 쓰던 팔레트 그대로
     if kind == "util":
         if p >= 80: return "red"
         if p >= 20: return "yellow"
@@ -173,10 +165,10 @@ def fixed_pct(p: float) -> str:
 def fixed_mib_pair(used: int, total: int) -> str:
     return f"{used:>6}/{total:<6} MiB"
 
-# ---------- bar 길이 결정(히스테리시스 포함) ----------
-HYSTERESIS_COLS = 6
 
-def _decide_bar_len_base(console_width: int, name_avg_len: int = 22) -> int:
+# ----------------------------- Bars (원래 로직 유지) -----------------------------
+
+def decide_bar_len(console_width: int, name_avg_len: int = 22) -> int:
     fixed_est = 43
     text_payload_est = 25
     free = max(0, console_width - fixed_est - name_avg_len - text_payload_est)
@@ -192,36 +184,14 @@ def _decide_bar_len_base(console_width: int, name_avg_len: int = 22) -> int:
         return 18
     return 22
 
-def decide_bar_len(console_width: int, prev_len: Optional[int]) -> int:
-    target = _decide_bar_len_base(console_width)
-    if prev_len is None:
-        return target
-    if abs(target - prev_len) < HYSTERESIS_COLS:
-        return prev_len
-    return target
-
 def draw_bar(pct: float, length: int, style: str) -> Text:
     length = max(3, length)
     fill = int(round((pct / 100.0) * length))
     fill = max(0, min(length, fill))
     return Text("█" * fill + "░" * (length - fill), style=style)
 
-def _util_cell_width(bar_len:int) -> int:
-    # bar + space + "100%"(4)
-    return (bar_len + 5) if bar_len > 0 else 4
-
-def _mem_cell_width(bar_len:int) -> int:
-    # bar + space + "100%" + space + " 123456/123456 MiB"(~17)
-    return (bar_len + 23) if bar_len > 0 else (4 + 1 + 17)
-
-def _compute_name_width(console_width:int, bar_len:int, user_w:int=12) -> int:
-    host_w = 9; cuda_w = 5; gpu_w = 2; temp_w = 3
-    util_w = _util_cell_width(bar_len); mem_w = _mem_cell_width(bar_len)
-    padding_budget = 8
-    name_w = console_width - (host_w + cuda_w + gpu_w + user_w + temp_w + util_w + mem_w + padding_budget)
-    return max(12, name_w)
-
-def format_util_mem(util: Optional[float], mem_used: int, mem_total: int, bar_len: int) -> Tuple[Text, Text]:
+def format_util_mem(util: Optional[float], mem_used: int, mem_total: int, console_width: int) -> Tuple[Text, Text]:
+    bar_len = decide_bar_len(console_width)
     util_pct = 0.0 if (util is None or math.isnan(util)) else max(0.0, min(100.0, float(util)))
     util_style = percent_style("util", util_pct)
     util_pct_text = Text(fixed_pct(util_pct), style=util_style)
@@ -240,6 +210,9 @@ def format_util_mem(util: Optional[float], mem_used: int, mem_total: int, bar_le
         util_cell = util_pct_text
         mem_cell = Text.assemble(mem_pct_text, Text(" "), mem_abs_text)
     return util_cell, mem_cell
+
+
+# ----------------------------- SSH / Queries -----------------------------
 
 async def ssh_run(host: str, cmd: str, identity: str) -> Tuple[int, str, str, float]:
     t0 = time.time()
@@ -307,6 +280,9 @@ async def fetch_apps_top_users_per_gpu(host: str, identity: str) -> Tuple[Dict[s
                 continue
     return top_pid_by_uuid, user_by_pid
 
+
+# ----------------------------- Parsing -----------------------------
+
 def parse_gpu_rows(text: str):
     rows = []
     driver = None
@@ -332,28 +308,19 @@ def parse_gpu_rows(text: str):
             pass
     return rows, driver, uuid_by_index
 
-# ---------- 고정폭 렌더(행 높이 고정 + ellipsis) ----------
-def render_table(state: Dict[str, dict], interval: float, now_ts: float, console_width: int, bar_len:int) -> Table:
-    user_w = 12
-    name_w = _compute_name_width(console_width, bar_len, user_w=user_w)
-    util_w = _util_cell_width(bar_len)
-    mem_w  = _mem_cell_width(bar_len)
 
-    tbl = Table(
-        title="Multi-Server GPU Monitor",
-        box=box.SIMPLE,
-        show_header=True,
-        expand=False,
-        pad_edge=False,
-    )
-    tbl.add_column("Host", width=9,  no_wrap=True)
-    tbl.add_column("CUDA", width=5,  no_wrap=True, justify="right")
-    tbl.add_column("GPU",  width=2,  no_wrap=True, justify="right")
-    tbl.add_column("User", width=user_w, no_wrap=True, overflow="ellipsis")
-    tbl.add_column("Name", width=name_w, no_wrap=True, overflow="ellipsis")
-    tbl.add_column("Util", width=util_w, no_wrap=True)
-    tbl.add_column("Mem",  width=mem_w,  no_wrap=True)
-    tbl.add_column("Temp", width=3,  no_wrap=True, justify="right")
+# ----------------------------- Rendering (원래 로직 유지) -----------------------------
+
+def render_table(state: Dict[str, dict], interval: float, now_ts: float, console_width: int) -> Table:
+    tbl = Table(title=f"Multi-Server GPU Monitor", box=box.SIMPLE_HEAVY)
+    tbl.add_column("Host", no_wrap=True)
+    tbl.add_column("CUDA", no_wrap=True)
+    tbl.add_column("GPU", justify="right", no_wrap=True)
+    tbl.add_column("User", no_wrap=True)
+    tbl.add_column("Name", no_wrap=False)
+    tbl.add_column("Util", justify="left", no_wrap=False)
+    tbl.add_column("Mem", justify="left", no_wrap=False)
+    tbl.add_column("Temp", justify="right", no_wrap=True)
 
     for host_key, data in state.items():
         sh = short_host(host_key)
@@ -371,12 +338,10 @@ def render_table(state: Dict[str, dict], interval: float, now_ts: float, console
 
         first = True
         for r in sorted(gpus, key=lambda x: x["idx"]):
-            util_cell, mem_cell = format_util_mem(float(r["util"]), r["mem_used"], r["mem_total"], bar_len)
+            util_cell, mem_cell = format_util_mem(float(r["util"]), r["mem_used"], r["mem_total"], console_width)
             temp_cell = colorize_temp(r["temp"])
-
-            name_cell = Text(r["name"], style="cyan"); name_cell.truncate(name_w, overflow="ellipsis")
-            user_txt = top_user_by_idx.get(r["idx"]) or "-"
-            user_cell = Text(user_txt, style="green3"); user_cell.truncate(user_w, overflow="ellipsis")
+            name_cell = Text(r["name"], style="cyan")
+            user_cell = Text(top_user_by_idx.get(r["idx"]) or "-", style="green3")
 
             tbl.add_row(
                 host_cell if first else Text(" " * 9),
@@ -391,8 +356,29 @@ def render_table(state: Dict[str, dict], interval: float, now_ts: float, console
             first = False
     return tbl
 
-# ---------- digest(변경 감지) ----------
+
+# ----------------------------- 변경 감지 (추가) -----------------------------
+
+def _band_key(last_ok_ts: Optional[float], has_error: bool, now_ts: float) -> str:
+    """
+    색상 구간만 반영(OK / STALE<30s / STALE≥30s / ERR) → 사소한 시간 변화로 인한 리렌더 방지
+    """
+    if has_error and last_ok_ts is None:
+        return "ERR"
+    if last_ok_ts is None:
+        return "OK"
+    age = now_ts - last_ok_ts
+    if age < 10:
+        return "OK"
+    if age < 30:
+        return "STALE1"
+    return "STALE2"
+
 def build_digest(state: Dict[str, dict], now_ts: float) -> Tuple:
+    """
+    현재 화면에 영향을 주는 값만 요약해서 튜플로 반환.
+    동일하면 렌더 생략(깜빡임 방지).
+    """
     out = []
     for host_key in sorted(state.keys()):
         d = state[host_key]
@@ -402,9 +388,12 @@ def build_digest(state: Dict[str, dict], now_ts: float) -> Tuple:
             (r["idx"], r["name"], r["util"], r["mem_used"], r["mem_total"], r["temp"])
             for r in sorted(d.get("gpus", []), key=lambda x: x["idx"])
         )
-        users_t = tuple(sorted((d.get("top_user_by_idx") or {}).items()))
+        users_t = tuple(sorted((d.get("top_user_by_idx") or {}).items()))  # (idx, user)
         out.append((short_host(host_key), band, cuda, gpus, users_t))
     return tuple(out)
+
+
+# ----------------------------- Main -----------------------------
 
 async def _amain(args: argparse.Namespace) -> None:
     hosts = parse_hosts(args.hosts)
@@ -417,8 +406,7 @@ async def _amain(args: argparse.Namespace) -> None:
         h: {"gpus": [], "last_ok_ts": None, "error": None, "warmed": False,
             "cuda": None, "driver": None, "top_user_by_idx": {}} for h in hosts
     }
-
-    prev_bar_len: Optional[int] = None
+    # 이전 프레임 digest 보관 (추가)
     prev_digest: Optional[Tuple] = None
 
     sem = asyncio.Semaphore(max(1, CONCURRENCY))
@@ -463,30 +451,26 @@ async def _amain(args: argparse.Namespace) -> None:
         Panel("Initializing...", border_style="cyan"),
         refresh_per_second=24,
         console=console,
-        auto_refresh=False,                 # ★ 자동 리프레시 금지
+        auto_refresh=False,  # ← 자동 리프레시 금지 (변경 시에만 수동 업데이트)
     ) as live:
         while True:
             tasks = [poll_host(h) for h in hosts]
             await asyncio.gather(*tasks, return_exceptions=True)
             now_ts = time.time()
-
-            # 프레임 공통 bar 길이(히스테리시스)
             width = console.size.width
-            bar_len = decide_bar_len(width, prev_bar_len)
-            prev_bar_len = bar_len
 
             # 변경 감지 → 동일하면 렌더 생략(깜빡임 원천 차단)
             digest = build_digest(state, now_ts)
             if digest != prev_digest:
                 prev_digest = digest
-                live.update(render_table(state, args.interval, now_ts, width, bar_len), refresh=True)
+                live.update(render_table(state, args.interval, now_ts, width), refresh=True)
 
             await asyncio.sleep(args.interval)
 
 def run() -> None:
     ap = argparse.ArgumentParser(description="Multi-host GPU terminal monitor (Windows-friendly)")
     ap.add_argument("-H", "--hosts", required=True, help="hosts file (alias/fqdn/user@host each line)")
-    ap.add_argument("-i", "--interval", type=float, default=0.5, help="refresh interval seconds (default 0.5)")
+    ap.add_argument("-i", "--interval", type=float, default=1, help="refresh interval seconds (default 1)")
     ap.add_argument("--ssh-key", default="", help="identity file (e.g. C:\\Users\\you\\.ssh\\id_ed25519)")
     ap.add_argument("--blacklist", default="", help="GPU blacklist, e.g. 'monday:0,1;gloryday:2;*:7'")
     ap.add_argument("--initial-wait", type=int, default=5, help="per-host first-connection wait seconds (default 5)")
