@@ -3,12 +3,15 @@
 import argparse
 import asyncio
 import contextlib
+import json
 import math
+import os
 import platform
 import random
 import shlex
 import sys
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from rich.console import Console
@@ -29,31 +32,49 @@ SSH_OPT = ""
 
 CSV_OPTS = "--format=csv,noheader,nounits"
 
-QUERY_GPU = "--query-gpu=index,uuid,name,utilization.gpu,temperature.gpu,memory.used,memory.total,driver_version"
-
-CUDA_PARSE_CMD = (
-    r"nvidia-smi -q | sed -n 's/.*CUDA Version *: *\([0-9.]\+\).*/\1/p' | head -n1"
+QUERY_GPU = (
+    "--query-gpu=index,uuid,name,utilization.gpu,temperature.gpu,memory.used,memory.total,driver_version"
 )
 
-APPS_QUERY = (
-    "--query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits"
-)
+CUDA_PARSE_CMD = r"nvidia-smi -q | sed -n 's/.*CUDA Version *: *\([0-9.]\+\).*/\1/p' | head -n1"
+
+APPS_QUERY = "--query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits"
+
+CONFIG_PATH = Path.home() / ".gpumon"
+
+
+# ----------------------------- Config I/O -----------------------------
+
+def load_config() -> Dict[str, object]:
+    try:
+        if CONFIG_PATH.exists():
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+def save_config(cfg: Dict[str, object]) -> None:
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if os.name == "posix":
+            with contextlib.suppress(Exception):
+                os.chmod(CONFIG_PATH, 0o600)
+    except Exception:
+        # 저장 실패는 치명적이지 않으므로 무시
+        pass
 
 
 # ----------------------------- Helpers -----------------------------
 
-
 def parse_hosts(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
-        hosts = [
-            ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")
-        ]
+        hosts = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
     return hosts
-
 
 def which_ssh() -> str:
     return "ssh.exe" if platform.system().lower().startswith("win") else "ssh"
-
 
 def build_ssh_cmd(
     host: str,
@@ -64,32 +85,21 @@ def build_ssh_cmd(
     ssh_bin = which_ssh()
     extra_opts = shlex.split(SSH_OPT) if SSH_OPT else []
     base_opts = [
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        f"ConnectTimeout={int(max(1, connect_timeout))}",
-        "-o",
-        "PreferredAuthentications=publickey",
-        "-o",
-        "PubkeyAuthentication=yes",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ServerAliveInterval=5",
-        "-o",
-        "ServerAliveCountMax=1",
-        "-o",
-        "ConnectionAttempts=1",
-        "-o",
-        "TCPKeepAlive=yes",
-        "-o",
-        "LogLevel=ERROR",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", f"ConnectTimeout={int(max(1, connect_timeout))}",
+        "-o", "PreferredAuthentications=publickey",
+        "-o", "PubkeyAuthentication=yes",
+        "-o", "BatchMode=yes",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=1",
+        "-o", "ConnectionAttempts=1",
+        "-o", "TCPKeepAlive=yes",
+        "-o", "LogLevel=ERROR",
     ]
     id_part: List[str] = []
     if identity:
         id_part = ["-i", identity, "-o", "IdentitiesOnly=yes"]
     return [ssh_bin] + base_opts + id_part + extra_opts + [host, remote_cmd]
-
 
 def short_host(label: str) -> str:
     s = label
@@ -99,10 +109,9 @@ def short_host(label: str) -> str:
         s = s.split(".", 1)[0]
     return s
 
-
 def parse_blacklist(spec: str) -> Dict[str, Set[int]]:
     bl: Dict[str, Set[int]] = {}
-    if not spec:
+    if spec is None or spec == "":
         return bl
     for group in spec.split(";"):
         group = group.strip()
@@ -125,7 +134,6 @@ def parse_blacklist(spec: str) -> Dict[str, Set[int]]:
             bl.setdefault(host_key, set()).update(idx_set)
     return bl
 
-
 def gpu_idx_blacklisted(host_label: str, idx: int, bl: Dict[str, Set[int]]) -> bool:
     if idx in bl.get("*", set()):
         return True
@@ -141,7 +149,6 @@ def gpu_idx_blacklisted(host_label: str, idx: int, bl: Dict[str, Set[int]]) -> b
 
 # ----------------------------- Styling -----------------------------
 
-
 def colorize_temp(t: Optional[int]) -> Text:
     if t is None:
         return Text("-", style="dim")
@@ -153,7 +160,6 @@ def colorize_temp(t: Optional[int]) -> Text:
         return Text(f"{t:>3}", style="white")
     else:
         return Text(f"{t:>3}", style="dim")
-
 
 def colorize_host(h: str, stale_age: Optional[float], has_error: bool) -> Text:
     h_fixed = f"{h:<9}"
@@ -168,37 +174,26 @@ def colorize_host(h: str, stale_age: Optional[float], has_error: bool) -> Text:
     else:
         return Text(h_fixed, style="bold red")
 
-
 def percent_style(kind: str, p: float) -> str:
-    # 기존 팔레트 유지
     if kind == "util":
-        if p >= 80:
-            return "red"
-        if p >= 20:
-            return "yellow"
-        if p >= 10:
-            return "white"
+        if p >= 80: return "red"
+        if p >= 20: return "yellow"
+        if p >= 10: return "white"
         return "dim"
     else:
-        if p >= 80:
-            return "red"
-        if p >= 20:
-            return "yellow"
-        if p >= 10:
-            return "white"
+        if p >= 80: return "red"
+        if p >= 20: return "yellow"
+        if p >= 10: return "white"
         return "dim"
-
 
 def fixed_pct(p: float) -> str:
     return f"{int(round(p)):>3}%"
-
 
 def fixed_mib_pair(used: int, total: int) -> str:
     return f"{used:>6}/{total:<6} MiB"
 
 
 # ----------------------------- Bars (원래 로직 유지) -----------------------------
-
 
 def decide_bar_len(console_width: int, name_avg_len: int = 22) -> int:
     fixed_est = 43
@@ -216,27 +211,19 @@ def decide_bar_len(console_width: int, name_avg_len: int = 22) -> int:
         return 18
     return 22
 
-
 def draw_bar(pct: float, length: int, style: str) -> Text:
     length = max(3, length)
     fill = int(round((pct / 100.0) * length))
     fill = max(0, min(length, fill))
     return Text("█" * fill + "░" * (length - fill), style=style)
 
-
-def format_util_mem(
-    util: Optional[float], mem_used: int, mem_total: int, console_width: int
-) -> Tuple[Text, Text]:
+def format_util_mem(util: Optional[float], mem_used: int, mem_total: int, console_width: int) -> Tuple[Text, Text]:
     bar_len = decide_bar_len(console_width)
-    util_pct = (
-        0.0 if (util is None or math.isnan(util)) else max(0.0, min(100.0, float(util)))
-    )
+    util_pct = 0.0 if (util is None or math.isnan(util)) else max(0.0, min(100.0, float(util)))
     util_style = percent_style("util", util_pct)
     util_pct_text = Text(fixed_pct(util_pct), style=util_style)
 
-    mem_pct = (
-        0.0 if mem_total <= 0 else max(0.0, min(100.0, (mem_used / mem_total) * 100.0))
-    )
+    mem_pct = 0.0 if mem_total <= 0 else max(0.0, min(100.0, (mem_used / mem_total) * 100.0))
     mem_style = percent_style("mem", mem_pct)
     mem_pct_text = Text(fixed_pct(mem_pct), style=mem_style)
     mem_abs_text = Text(f" {fixed_mib_pair(mem_used, mem_total)}", style="white")
@@ -254,7 +241,6 @@ def format_util_mem(
 
 # ----------------------------- SSH / Queries -----------------------------
 
-
 async def ssh_run(host: str, cmd: str, identity: str) -> Tuple[int, str, str, float]:
     t0 = time.time()
     proc = await asyncio.create_subprocess_exec(
@@ -265,21 +251,13 @@ async def ssh_run(host: str, cmd: str, identity: str) -> Tuple[int, str, str, fl
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)
         dt = time.time() - t0
-        return (
-            proc.returncode,
-            out.decode("utf-8", "ignore"),
-            err.decode("utf-8", "ignore"),
-            dt,
-        )
+        return proc.returncode, out.decode("utf-8", "ignore"), err.decode("utf-8", "ignore"), dt
     except asyncio.TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         return 255, "", f"timeout({TIMEOUT:.0f}s)", TIMEOUT
 
-
-async def fetch_gpu_and_cuda(
-    host: str, wait_first: bool, wait_sec: int, identity: str
-) -> Tuple[int, str, str, Optional[str]]:
+async def fetch_gpu_and_cuda(host: str, wait_first: bool, wait_sec: int, identity: str) -> Tuple[int, str, str, Optional[str]]:
     gpu_cmd = f"LC_ALL=C {shlex.quote(NVIDIA_SMI)} {QUERY_GPU} {CSV_OPTS}"
     if wait_first and wait_sec > 0:
         gpu_cmd = f"sleep {wait_sec}; {gpu_cmd}"
@@ -293,13 +271,8 @@ async def fetch_gpu_and_cuda(
             cuda_ver = v[0].strip() or None
     return rc, out, err, cuda_ver
 
-
-async def fetch_apps_top_users_per_gpu(
-    host: str, identity: str
-) -> Tuple[Dict[str, int], Dict[int, str]]:
-    rc, out, err, _ = await ssh_run(
-        host, f"LC_ALL=C {NVIDIA_SMI} {APPS_QUERY}", identity
-    )
+async def fetch_apps_top_users_per_gpu(host: str, identity: str) -> Tuple[Dict[str, int], Dict[int, str]]:
+    rc, out, err, _ = await ssh_run(host, f"LC_ALL=C {NVIDIA_SMI} {APPS_QUERY}", identity)
     top_pid_by_uuid: Dict[str, int] = {}
     if rc != 0 or not out.strip():
         return top_pid_by_uuid, {}
@@ -310,8 +283,7 @@ async def fetch_apps_top_users_per_gpu(
             continue
         uuid, pid_s, mem_s = parts[0], parts[1], parts[2]
         try:
-            pid = int(pid_s)
-            mem = int(mem_s)
+            pid = int(pid_s); mem = int(mem_s)
         except Exception:
             continue
         if uuid not in top_mem_by_uuid or mem > top_mem_by_uuid[uuid]:
@@ -321,9 +293,7 @@ async def fetch_apps_top_users_per_gpu(
     if not top_pid_by_uuid:
         return top_pid_by_uuid, {}
     pid_list = ",".join(str(p) for p in top_pid_by_uuid.values())
-    rc2, out2, err2, _ = await ssh_run(
-        host, f"ps -o pid=,user= -p {pid_list}", identity
-    )
+    rc2, out2, err2, _ = await ssh_run(host, f"ps -o pid=,user= -p {pid_list}", identity)
     user_by_pid: Dict[int, str] = {}
     if rc2 == 0 and out2.strip():
         for ln in out2.splitlines():
@@ -340,7 +310,6 @@ async def fetch_apps_top_users_per_gpu(
 
 # ----------------------------- Parsing -----------------------------
 
-
 def parse_gpu_rows(text: str):
     rows = []
     driver = None
@@ -353,26 +322,15 @@ def parse_gpu_rows(text: str):
         if len(parts) < 8:
             continue
         try:
-            idx = int(parts[0])
-            uuid = parts[1]
-            name = parts[2]
-            util = int(parts[3])
-            temp = int(parts[4])
-            mem_used = int(parts[5])
-            mem_total = int(parts[6])
+            idx = int(parts[0]); uuid = parts[1]; name = parts[2]
+            util = int(parts[3]); temp = int(parts[4])
+            mem_used = int(parts[5]); mem_total = int(parts[6])
             driver = parts[7]
             uuid_by_index[idx] = uuid
-            rows.append(
-                {
-                    "idx": idx,
-                    "uuid": uuid,
-                    "name": name,
-                    "util": util,
-                    "temp": temp,
-                    "mem_used": mem_used,
-                    "mem_total": mem_total,
-                }
-            )
+            rows.append({
+                "idx": idx, "uuid": uuid, "name": name, "util": util, "temp": temp,
+                "mem_used": mem_used, "mem_total": mem_total,
+            })
         except Exception:
             pass
     return rows, driver, uuid_by_index
@@ -380,10 +338,7 @@ def parse_gpu_rows(text: str):
 
 # ----------------------------- Rendering (원래 로직 유지) -----------------------------
 
-
-def render_table(
-    state: Dict[str, dict], interval: float, now_ts: float, console_width: int
-) -> Table:
+def render_table(state: Dict[str, dict], interval: float, now_ts: float, console_width: int) -> Table:
     tbl = Table(title=f"Multi-Server GPU Monitor", box=box.SIMPLE_HEAVY)
     tbl.add_column("Host", no_wrap=True)
     tbl.add_column("CUDA", no_wrap=True)
@@ -410,9 +365,7 @@ def render_table(
 
         first = True
         for r in sorted(gpus, key=lambda x: x["idx"]):
-            util_cell, mem_cell = format_util_mem(
-                float(r["util"]), r["mem_used"], r["mem_total"], console_width
-            )
+            util_cell, mem_cell = format_util_mem(float(r["util"]), r["mem_used"], r["mem_total"], console_width)
             temp_cell = colorize_temp(r["temp"])
             name_cell = Text(r["name"], style="cyan")
             user_cell = Text(top_user_by_idx.get(r["idx"]) or "-", style="green3")
@@ -431,13 +384,9 @@ def render_table(
     return tbl
 
 
-# ----------------------------- 변경 감지 (추가) -----------------------------
-
+# ----------------------------- 변경 감지 -----------------------------
 
 def _band_key(last_ok_ts: Optional[float], has_error: bool, now_ts: float) -> str:
-    """
-    색상 구간만 반영(OK / STALE<30s / STALE≥30s / ERR) → 사소한 시간 변화로 인한 리렌더 방지
-    """
     if has_error and last_ok_ts is None:
         return "ERR"
     if last_ok_ts is None:
@@ -449,12 +398,7 @@ def _band_key(last_ok_ts: Optional[float], has_error: bool, now_ts: float) -> st
         return "STALE1"
     return "STALE2"
 
-
 def build_digest(state: Dict[str, dict], now_ts: float) -> Tuple:
-    """
-    현재 화면에 영향을 주는 값만 요약해서 튜플로 반환.
-    동일하면 렌더 생략(깜빡임 방지).
-    """
     out = []
     for host_key in sorted(state.keys()):
         d = state[host_key]
@@ -464,13 +408,12 @@ def build_digest(state: Dict[str, dict], now_ts: float) -> Tuple:
             (r["idx"], r["name"], r["util"], r["mem_used"], r["mem_total"], r["temp"])
             for r in sorted(d.get("gpus", []), key=lambda x: x["idx"])
         )
-        users_t = tuple(sorted((d.get("top_user_by_idx") or {}).items()))  # (idx, user)
+        users_t = tuple(sorted((d.get("top_user_by_idx") or {}).items()))
         out.append((short_host(host_key), band, cuda, gpus, users_t))
     return tuple(out)
 
 
 # ----------------------------- Main -----------------------------
-
 
 async def _amain(args: argparse.Namespace) -> None:
     # 실행 시 1회만 콘솔 clear + 빈 줄 출력
@@ -484,18 +427,9 @@ async def _amain(args: argparse.Namespace) -> None:
 
     blspec = parse_blacklist(args.blacklist)
     state: Dict[str, dict] = {
-        h: {
-            "gpus": [],
-            "last_ok_ts": None,
-            "error": None,
-            "warmed": False,
-            "cuda": None,
-            "driver": None,
-            "top_user_by_idx": {},
-        }
-        for h in hosts
+        h: {"gpus": [], "last_ok_ts": None, "error": None, "warmed": False,
+            "cuda": None, "driver": None, "top_user_by_idx": {}} for h in hosts
     }
-    # 이전 프레임 digest 보관 (추가)
     prev_digest: Optional[Tuple] = None
 
     sem = asyncio.Semaphore(max(1, CONCURRENCY))
@@ -506,21 +440,14 @@ async def _amain(args: argparse.Namespace) -> None:
                 await asyncio.sleep(random.random() * JITTER)
 
             rc, out, err, cuda_ver = await fetch_gpu_and_cuda(
-                host=h,
-                wait_first=not state[h]["warmed"],
-                wait_sec=args.initial_wait,
-                identity=args.ssh_key,
+                host=h, wait_first=not state[h]["warmed"], wait_sec=args.initial_wait, identity=args.ssh_key
             )
             if rc == 0 and out.strip():
                 rows, driver, uuid_by_index = parse_gpu_rows(out)
                 base = short_host(h)
-                rows = [
-                    r for r in rows if not gpu_idx_blacklisted(base, r["idx"], blspec)
-                ]
+                rows = [r for r in rows if not gpu_idx_blacklisted(base, r["idx"], blspec)]
 
-                top_pid_by_uuid, user_by_pid = await fetch_apps_top_users_per_gpu(
-                    h, args.ssh_key
-                )
+                top_pid_by_uuid, user_by_pid = await fetch_apps_top_users_per_gpu(h, args.ssh_key)
                 top_user_by_idx: Dict[int, str] = {}
                 for idx, uuid in uuid_by_index.items():
                     if uuid in top_pid_by_uuid:
@@ -540,9 +467,7 @@ async def _amain(args: argparse.Namespace) -> None:
                 if top_user_by_idx:
                     state[h]["top_user_by_idx"] = top_user_by_idx
             else:
-                last_line = (
-                    (err.strip().splitlines() or [""])[-1] if err else f"rc={rc}"
-                )
+                last_line = (err.strip().splitlines() or [""])[-1] if err else f"rc={rc}"
                 state[h]["error"] = last_line
 
     with Live(
@@ -557,56 +482,60 @@ async def _amain(args: argparse.Namespace) -> None:
             now_ts = time.time()
             width = console.size.width
 
-            # 변경 감지 → 동일하면 렌더 생략(깜빡임 원천 차단)
             digest = build_digest(state, now_ts)
             if digest != prev_digest:
                 prev_digest = digest
-                live.update(
-                    render_table(state, args.interval, now_ts, width), refresh=True
-                )
+                live.update(render_table(state, args.interval, now_ts, width), refresh=True)
 
             await asyncio.sleep(args.interval)
 
-
 def run() -> None:
-    ap = argparse.ArgumentParser(
-        description="Multi-host GPU terminal monitor (Windows-friendly)"
+    ap = argparse.ArgumentParser(description="Multi-host GPU terminal monitor (Windows-friendly)")
+    # 모든 옵션을 선택적으로 받아서 ~/.gpumon 으로 보완/저장
+    ap.add_argument("-H", "--hosts", default=None, help="hosts file (alias/fqdn/user@host each line)")
+    ap.add_argument("-i", "--interval", type=float, default=None, help="refresh interval seconds")
+    ap.add_argument("--ssh-key", default=None, help="identity file (e.g. C:\\Users\\you\\.ssh\\id_ed25519)")
+    ap.add_argument("--blacklist", default=None, help="GPU blacklist, e.g. 'monday:0,1;gloryday:2;*:7'")
+    ap.add_argument("--initial-wait", type=int, default=None, help="per-host first-connection wait seconds")
+    args_in = ap.parse_args()
+
+    # 1) 기존 설정 로드
+    cfg = load_config()
+
+    # 2) 인자와 설정 병합 (인자가 우선)
+    hosts_path = args_in.hosts or cfg.get("hosts")
+    interval   = args_in.interval if args_in.interval is not None else cfg.get("interval", 1)
+    ssh_key    = args_in.ssh_key if args_in.ssh_key is not None else cfg.get("ssh_key", "")
+    blacklist  = args_in.blacklist if args_in.blacklist is not None else cfg.get("blacklist", "")
+    init_wait  = args_in.initial_wait if args_in.initial_wait is not None else cfg.get("initial_wait", 5)
+
+    if not hosts_path:
+        console.print("[red]No hosts provided and no ~/.gpumon config found.[/red]")
+        console.print("Usage: gpumon -H hosts.txt [--ssh-key KEY] [--blacklist SPEC] [--initial-wait N] [-i SECS]")
+        sys.exit(1)
+
+    # 3) 최종 설정 저장(마지막 사용값을 ~/.gpumon 에 기록)
+    save_config({
+        "hosts": hosts_path,
+        "interval": interval,
+        "ssh_key": ssh_key,
+        "blacklist": blacklist,
+        "initial_wait": init_wait,
+    })
+
+    # 4) 병합된 인자로 실행
+    merged = argparse.Namespace(
+        hosts=hosts_path,
+        interval=interval,
+        ssh_key=ssh_key,
+        blacklist=blacklist,
+        initial_wait=init_wait,
     )
-    ap.add_argument(
-        "-H",
-        "--hosts",
-        required=True,
-        help="hosts file (alias/fqdn/user@host each line)",
-    )
-    ap.add_argument(
-        "-i",
-        "--interval",
-        type=float,
-        default=1,
-        help="refresh interval seconds (default 1)",
-    )
-    ap.add_argument(
-        "--ssh-key",
-        default="",
-        help="identity file (e.g. C:\\Users\\you\\.ssh\\id_ed25519)",
-    )
-    ap.add_argument(
-        "--blacklist",
-        default="",
-        help="GPU blacklist, e.g. 'monday:0,1;gloryday:2;*:7'",
-    )
-    ap.add_argument(
-        "--initial-wait",
-        type=int,
-        default=5,
-        help="per-host first-connection wait seconds (default 5)",
-    )
-    args = ap.parse_args()
     try:
-        asyncio.run(_amain(args))
+        asyncio.run(_amain(merged))
     except KeyboardInterrupt:
         pass
 
-
 if __name__ == "__main__":
     run()
+
