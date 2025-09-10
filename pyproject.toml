@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.22"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpumon"
+version = "0.1.0"
+description = "Multi-host GPU monitor over SSH with rich TUI (Windows-friendly)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name="Seungchan Lee"}]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Environment :: Console",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "rich>=13.0.0"
+]
+
+[project.scripts]
+gpumon = "gpumon.cli:run"
